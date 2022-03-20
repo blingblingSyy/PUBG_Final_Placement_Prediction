@@ -1,5 +1,5 @@
 ---
-title: "Group_5_Class_C"
+title: "PUBG"
 date: "`r Sys.Date()`"
 output:
   rmdformats::readthedown:
