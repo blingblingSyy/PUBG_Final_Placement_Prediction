@@ -1,0 +1,1020 @@
+---
+title: "Group_5_Class_C"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    toc_depth: 3
+
+---
+
+
+```{r setup, include = F}
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(parallel)
+library(recipes)
+library(rsample)
+library(GGally)
+library(caret)
+library(rpart)       # direct engine for decision tree application
+library(rpart.plot)  # for plotting decision trees
+library(pdp)
+library(ranger)
+library(randomForest)
+library(vip)
+library(gbm)
+library(h2o)
+library(splines)#for regression spline
+library(gam)#for logistic regression spline & generalized additive models
+library(MASS)
+library(pROC)
+library(dplyr)
+library(rattle)
+library(mgcv)
+library(spm)
+library(kernlab)
+library(xgboost)
+```
+
+
+
+# Back Ground Information
+
+## Empirical Feature Selection: Not Performed Yet
+
+Not helping in Single-Player mode:
+
+DBNOs, revives
+
+Elo ranking points (external):
+
+killPoints(may stay because it's more directly reflecting the in-game performance of a player), winPoints, rankPoints (They are also strongly correlated)
+
+Strongly correlated:
+
+distance, walkDistance
+
+kills, longestKills, killStreaks, killPlace
+
+maxPlace, numGroups
+
+## Data Explanation
+
+*DBNOs* - Number of enemy players knocked.
+
+*assists* - Number of enemy players this player damaged that were killed by teammates.
+
+*boosts* - Number of boost items used.
+
+*damageDealt* - Total damage dealt. Note: Self inflicted damage is subtracted.
+
+*headshotKills* - Number of enemy players killed with headshots.
+
+*heals* - Number of healing items used.
+
+*Id* - Player’s Id
+
+*killPlace* - Ranking in match of number of enemy players killed.
+
+*killPoints* - Kills-based external ranking of player. (Think of this as an Elo ranking where only kills matter.) If there is a value other than -1 in rankPoints, then any 0 in killPoints should be treated as a “None”.
+
+*killStreaks* - Max number of enemy players killed in a short amount of time.
+
+*kills* - Number of enemy players killed.
+
+*longestKill* - Longest distance between player and player killed at time of death. This may be misleading, as downing a player and driving away may lead to a large longestKill stat.
+
+*matchDuration* - Duration of match in seconds.
+
+*matchId* - ID to identify match. There are no matches that are in both the training and testing set.
+
+*matchType* - String identifying the game mode that the data comes from. The standard modes are “solo”, “duo”, “squad”, “solo-fpp”, “duo-fpp”, and “squad-fpp”; other modes are from events or custom matches.
+
+***rankPoints*** - Elo-like ranking of player. This ranking is inconsistent and is being deprecated in the API’s next version, so use with caution. Value of -1 takes place of “None”.
+
+*revives* - Number of times this player revived teammates.
+
+*rideDistance* - Total distance traveled in vehicles measured in meters.
+
+*roadKills* - Number of kills while in a vehicle.
+
+*swimDistance* - Total distance traveled by swimming measured in meters.
+
+*teamKills* - Number of times this player killed a teammate.
+
+*vehicleDestroys* - Number of vehicles destroyed.
+
+*walkDistance* - Total distance traveled on foot measured in meters.
+
+*weaponsAcquired* - Number of weapons picked up.
+
+***winPoints*** - Win-based external ranking of player. (Think of this as an Elo ranking where only winning matters.) If there is a value other than -1 in rankPoints, then any 0 in winPoints should be treated as a “None”.
+
+*groupId* - ID to identify a group within a match. If the same group of players plays in different matches, they will have a different groupId each time.
+
+*numGroups* - Number of groups we have data for in the match.
+
+*maxPlace* - Worst placement we have data for in the match. This may not match with numGroups, as sometimes the data skips over placements.
+
+*winPlacePerc* - _The target of prediction_. This is a percentile winning placement, where 1 corresponds to 1st place, and 0 corresponds to last place in the match. It is calculated off of maxPlace, not numGroups, so it is possible to have missing chunks in a match.
+
+# Set-up
+
+## Load Original Data
+
+```{r}
+pubg <- read.csv("train_V2.csv")
+attach(pubg)
+str(pubg)
+```
+
+```{r}
+#remove NA
+sum(is.na(pubg))
+pubg.new <- na.omit(pubg)
+sum(is.na(pubg.new))
+```
+
+## Sample
+
+```{r}
+set.seed(10)
+
+solo.pubg <- pubg.new %>%
+  group_by(matchId) %>%
+  filter(matchType == 'solo-fpp') 
+
+uniq_matchID <- unique(solo.pubg$matchId)
+sample_match <- uniq_matchID[sample(1: length(uniq_matchID), 100)]
+
+sample.pubg <- solo.pubg %>% 
+  filter(matchId %in% sample_match)
+
+dim(pubg)
+dim(sample.pubg)
+
+```
+
+```{r}
+write.csv(sample.pubg, "sampled_pubg.csv", row.names = FALSE)
+```
+
+
+# Empirical Feature Selection & EDA: Start Here
+
+```{r}
+PUBG <- read.csv("sampled_pubg.csv")
+summary(PUBG)
+
+```
+
+## Empirical Feature Selection
+
+```{r}
+PUBG.new <- PUBG[, setdiff(names(PUBG), c("DBNOs", "revives", "winPoints", "rankPoints", "killPoints", "matchType", "numGroup"))]
+```
+
+## Remove Outliers (Move Distance == 0)
+
+```{r}
+PUBG.new.1 <- PUBG.new %>%
+  mutate(distance = walkDistance + swimDistance + rideDistance)
+
+PUBG.new.2 <- PUBG.new.1 %>%
+  filter(distance != 0)
+
+PUBG.new.2 <- PUBG.new.2[,-ncol(PUBG.new.2)]
+```
+
+
+## Data Split
+
+```{r}
+# First we split the data into a 80% training set and a 20% testing set
+set.seed(7027)
+split  <- initial_split(PUBG.new.2, prop = 0.7, strata = "winPlacePerc") 
+
+pubg.train  <- training(split)
+pubg.test   <- testing(split)
+pubg.trainFeatMat <- pubg.train[, setdiff(names(pubg.train), "winPlacePerc")]
+pubg.trainLabel <- pubg.train$winPlacePerc
+pubg.testFeatMat <- pubg.test$winPlacePerc
+pubg.testLabel <- pubg.test[,setdiff(names(pubg.test), "winPlacePerc")]
+```
+
+## Correlation: Spearman
+
+```{r}
+cormatrix <- cor(PUBG.new.2[, c(-1, -2, -3)], method = 'spearman')
+corrplot(cormatrix, method = "shade", order = "hclust", tl.cex = 0.6, tl.col = "#4CA1AF", tl.srt = 45)
+```
+
+
+## Distribution Visualization
+
+
+```{r}
+#view distribution
+par(mfrow = c(3, 3))
+for(i in 4:ncol(PUBG.new.2)){
+  plot(density(PUBG.new.2[,i]), main = colnames(PUBG.new.2)[i])
+}
+```
+
+
+
+
+
+# Data Preparation for All Methods
+
+```{r}
+pubg.train.1 <- pubg.train[, -c(1,2,3)]
+str(pubg.train.1)
+```
+
+
+```{r}
+blueprint<-
+  recipe(winPlacePerc~., data = pubg.train.1)%>%
+  step_nzv(all_predictors()) %>%
+  step_YeoJohnson(all_numeric(), -all_outcomes()) %>%
+  step_center(all_predictors())  %>%
+  step_scale(all_predictors())
+```
+
+
+```{r}
+pubg.train.baked <- prep(blueprint, training = pubg.train.1) %>%  
+  bake(new_data = pubg.train.1)
+
+pubg.test.baked <- prep(blueprint, training = pubg.train.1) %>%  
+  bake(new_data = pubg.test)
+
+```
+
+
+
+```{r}
+setdiff(colnames(pubg.train.1), colnames(pubg.train.baked))
+```
+
+```{r}
+#view distribution
+par(mfrow = c(3, 3))
+for(i in 1:ncol(pubg.train.1)){
+  plot(density(pubg.train.1[,i]), main = colnames(pubg.train.1)[i])
+}
+```
+
+```{r}
+#view distribution
+par(mfrow = c(3, 3))
+for(i in 1:ncol(pubg.train.baked)){
+  plot(density(as.matrix(pubg.train.baked[,i])), main = colnames(pubg.train.baked)[i])
+}
+```
+
+
+# GAM
+
+## Train
+
+```{r}
+set.seed(7027)
+
+gam_fit <- train(blueprint, 
+        data = pubg.train.1,
+        method = "gam",
+        trControl = trainControl(method = "cv", number = 5),
+        tuneGrid = data.frame(method = "GCV.Cp", select = FALSE)
+)
+
+summary(gam_fit$finalModel)
+```
+```{r}
+gam_fit$finalModel
+gam_cv_rmse <- gam_fit$results$RMSE
+gam_cv_rmse
+```
+
+
+
+
+
+# KNN
+
+## Train
+
+```{r}
+cl.cores <- detectCores()
+cl <- makeCluster(cl.cores)#将进行多线程运算的命令储存在cl中
+cl#进行多线程运算
+
+
+#create a resampling method
+set.seed(7027)
+
+cv<-trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 1
+)
+
+#create a hyperparametric grid search
+hyper_grid.knn <- expand.grid(k=seq(2,25,by=1))
+
+#execute grid search with knn model, use RMSE as preferred metric
+knn_fit<-train(
+  blueprint,
+  data=pubg.train.1,
+  method="knn",
+  trControl=cv,
+  tuneGrid = hyper_grid.knn,
+  metric = "RMSE"
+)
+
+knn_fit
+summary(knn_fit)
+
+stopCluster(cl)#结束多线程运算
+```
+
+```{r}
+arrange(knn_fit$results, RMSE)
+knn_cv_rmse <- min(knn_fit$results$RMSE)
+knn_cv_rmse
+```
+
+
+
+# SVM
+
+```{r}
+#Tune an SVM with radial basis kernel
+set.seed(7027)  # for reproducibility
+
+svm_fit <- train(
+  blueprint, 
+  data = pubg.train.1,
+  method = "svmRadial",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneLength = 10
+)
+
+
+head(arrange(svm_fit$results, RMSE))
+```
+
+```{r}
+svm_cv_rmse <- min(svm_fit$results$RMSE)
+svm_cv_rmse
+```
+
+```{r}
+# Plot results
+ggplot(svm_fit) + 
+  theme_light() + 
+  geom_point(aes(x = 2, y = min(svm_fit$results$RMSE)), color = "red", fill = "red", size = 3)
+
+```
+
+# Decision Tree
+
+## Train
+
+```{r}
+set.seed(7027)
+dt <- train(
+  blueprint,
+  data = pubg.train.1,
+  method = "rpart",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneLength = 10, 
+  metric = "RMSE"
+)
+
+fancyRpartPlot(dt$finalModel)
+```
+
+
+
+
+```{r}
+arrange(dt$results,RMSE)
+dt_cv_rmse <- min(dt$results$RMSE)
+dt_cv_rmse
+```
+
+
+
+# Random Forest
+
+## Train
+
+
+```{r}
+set.seed(7027)
+
+n_features <- ncol(pubg.train.baked) - 1
+
+hyper_grid.rf <- expand.grid(
+  mtry = floor(n_features * c(.15, .25, .333, .4)),
+  min.node.size = c(1, 3, 5, 10), 
+  replace = c(TRUE, FALSE),                               
+  sample.fraction = c(.5, .63, .8),                       
+  rmse = NA                                               
+)
+
+
+for(i in c(1:nrow(hyper_grid.rf))) {
+  cv <- rgcv(#rgcv is a function for cv on ranger
+    trainx <- pubg.train.baked[,-ncol(pubg.train.baked)],
+    trainy <- pubg.train.baked$winPlacePerc,
+    cv.fold = 5, 
+    num.trees       = n_features * 100,
+    mtry            = hyper_grid.rf$mtry[i],
+    min.node.size   = hyper_grid.rf$min.node.size[i],
+    replace         = hyper_grid.rf$replace[i],
+    sample.fraction = hyper_grid.rf$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 7027,
+    respect.unordered.factors = 'order'
+  )
+
+  hyper_grid.rf$rmse[i] <- cv$rmse
+}
+
+```
+
+
+
+
+```{r}
+head(arrange(hyper_grid.rf, rmse))
+rf_cv_rmse <- min(hyper_grid.rf$rmse)
+rf_cv_rmse
+#0.06334183
+```
+
+
+
+```{r}
+cl.cores <- detectCores()#see the number of cores of the computer
+cl <- makeCluster(cl.cores)#store the command to use all the cores in cl
+cl
+
+bestrf <- ranger(
+    formula         = winPlacePerc ~.,
+    data            = pubg.train.baked,
+    num.trees       = n_features * 100,
+    mtry            = 6,
+    min.node.size   = 1,
+    replace         = TRUE,
+    sample.fraction = 0.63,
+    verbose         = FALSE,
+    seed            = 7027,
+    respect.unordered.factors = 'order',
+    importance = "permutation"
+  )
+
+
+stopCluster(cl)
+
+
+```
+
+
+
+
+# Basic GBM
+
+## Tuning
+
+### Tree Number to Start
+
+```{r}
+
+set.seed(7027)
+
+ basic.boost <- gbm(
+  formula = winPlacePerc ~.,
+    data = pubg.train.baked,
+  n.trees = 5000,
+  distribution = "gaussian",
+  shrinkage = 0.05,
+  interaction.depth = 3,
+  n.minobsinnode = 10,
+  cv.folds = 5
+  )
+
+ best <- which.min(basic.boost$cv.error)
+ sqrt(basic.boost$cv.error[best])
+ 
+ gbm.perf(basic.boost, method = "cv")
+ #4738
+```
+
+### Tuning Learning Rate
+
+use n.trees = 5000 to tune learning rate
+
+```{r}
+cl
+
+hyper_grid <- expand.grid(
+  learning_rate = c(0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  time = NA
+)
+
+set.seed(7027)
+
+for(i in seq_len(nrow(hyper_grid))){
+  train_time <- system.time(
+    {
+        basic.boost <- gbm(
+  formula = winPlacePerc ~.,
+    data = pubg.train.baked,
+  n.trees = 5000,
+  distribution = "gaussian",
+  shrinkage = hyper_grid$learning_rate[i],
+  interaction.depth = 3,
+  n.minobsinnode = 10,
+  cv.folds = 5
+  )
+    }
+  )
+
+  hyper_grid$RMSE[i] <- sqrt(min(basic.boost$cv.error))
+  hyper_grid$trees[i] <- which.min(basic.boost$cv.error)
+  hyper_grid$time[i] <- train_time[["elapsed"]]
+}
+
+```
+
+best learning rate 0.05
+
+```{r}
+arrange(hyper_grid, RMSE)
+#best learning rate 0.05
+```
+### Tuning Other Hyper-parameters
+
+use learning rate = 0.05 to tune other parameters
+
+```{r}
+cl
+
+hyper_grid <- expand.grid(
+  n.trees = 5000,
+  shrinkage = 0.05,
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+# create model fit function
+model_fit <- function(n.trees, shrinkage, interaction.depth, n.minobsinnode) {
+  set.seed(7027)
+  m <- gbm(
+    formula =  winPlacePerc ~ .,
+    data = pubg.train.baked,
+    distribution = "gaussian",
+    n.trees = n.trees,
+    shrinkage = shrinkage,
+    interaction.depth = interaction.depth,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 5
+  )
+  # compute RMSE
+  sqrt(min(m$cv.error))
+}
+
+# perform search grid with functional programming
+hyper_grid$rmse <- purrr::pmap_dbl(
+  hyper_grid,
+  ~ model_fit(
+    n.trees = ..1,
+    shrinkage = ..2,
+    interaction.depth = ..3,
+    n.minobsinnode = ..4
+    )
+)
+
+arrange(hyper_grid, rmse)
+
+
+#best hyper: 5000 0.05 depth7 node5
+#0.05710779
+
+```
+
+
+### Re-tuning Learning Rate
+
+```{r}
+cl.cores <- detectCores()#see the number of cores of the computer
+cl <- makeCluster(cl.cores)#store the command to use all the cores in cl
+cl
+#re-tune the learning rate
+hyper_grid.gbm <- expand.grid(
+  learning_rate = c(0.1, 0.05, 0.01),
+  RMSE = NA,
+  trees = NA,
+  time = NA
+)
+
+set.seed(7027)
+
+for(i in seq_len(nrow(hyper_grid.gbm))){
+  train_time <- system.time(
+    {
+        basic.boost <- gbm(
+    formula =  winPlacePerc ~ .,
+    data = pubg.train.baked,
+  n.trees = 5000,
+  distribution = "gaussian",
+  shrinkage = hyper_grid.gbm$learning_rate[i],
+  interaction.depth = 7,
+  n.minobsinnode = 5,
+  cv.folds = 5
+  )
+    }
+  )
+
+  hyper_grid.gbm$RMSE[i] <- sqrt(min(basic.boost$cv.error))
+  hyper_grid.gbm$trees[i] <- which.min(basic.boost$cv.error)
+  hyper_grid.gbm$time[i] <- train_time[["elapsed"]]
+}
+
+arrange(hyper_grid.gbm, RMSE)
+#no need to re-tune
+stopCluster(cl)
+#0.05682552
+```
+
+```{r}
+basic_cv_rmse <- min(hyper_grid.gbm$RMSE)
+basic_cv_rmse
+```
+
+
+**best hyper parameter:**
+
+number of trees = 5000 
+learning rate = 0.05 
+depth = 7 
+node = 5
+
+## Final Basic GBM 
+
+```{r}
+cl.cores <- detectCores()#see the number of cores of the computer
+cl <- makeCluster(cl.cores)#store the command to use all the cores in cl
+cl
+set.seed(7027)
+
+bestgbm <- gbm(
+    formula =  winPlacePerc ~ .,
+    data = pubg.train.baked,
+  n.trees = 5000,
+  distribution = "gaussian",
+  shrinkage = 0.05,
+  interaction.depth = 7,
+  n.minobsinnode = 5,
+  cv.folds = 5
+  )
+
+
+stopCluster(cl)
+```
+
+
+
+# Stochastic GBM
+
+## preparation
+
+```{}
+h2o.init()
+```
+
+
+```{}
+set.seed(7027)
+
+
+#convert training data to h2o object
+train_h2o <- as.h2o(pubg.train.baked)
+
+test_h2o <- as.h2o(pubg.test.baked)
+
+#set the response column to price
+response <- "winPlacePerc"
+
+#set the predictor names
+predictors <- setdiff(names(pubg.train.baked), "winPlacePerc")
+
+#count the number of features in training data
+n_features <- length(predictors)
+
+```
+
+
+
+```{}
+# refined hyperparameter grid
+hyper_grid <- list(
+  sample_rate = c(0.5, 0.75, 1),              # row subsampling
+  col_sample_rate = c(0.5, 0.75, 1),          # col subsampling for each split
+  col_sample_rate_per_tree = c(0.5, 0.75, 1)  # col subsampling for each tree
+)
+
+```
+
+
+```{}
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.001,   
+  stopping_rounds = 10,         
+  max_runtime_secs = 60*45  
+)
+
+```
+
+## Train
+
+```{}
+set.seed(7027)
+#h2o.shutdown()
+# perform grid search 
+grid <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_grid",
+  x = predictors, 
+  y = response,
+  training_frame = train_h2o,
+  hyper_params = hyper_grid,
+  ntrees = 5000,
+  learn_rate = 0.05,
+  max_depth = 7,
+  min_rows = 5,
+  nfolds = 5,
+  stopping_rounds = 10,
+  stopping_tolerance = 0.001,
+  search_criteria = search_criteria,
+  seed = 7027
+)
+
+
+```
+
+
+```{}
+# collect the results and sort by our model performance metric of choice
+grid_perf <- h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "rmse", 
+  decreasing = FALSE
+)
+
+grid_perf
+```
+
+
+
+
+```{}
+best_model_id <- grid_perf@model_ids[[1]]
+best_model <- h2o.getModel(best_model_id)
+
+# Now let’s get performance metrics on the best model
+h2o.performance(model = best_model, xval = TRUE)
+
+sto_cv_rmse = h2o.rmse(best_model, xval = TRUE)
+sto_cv_rmse
+```
+
+
+## Test Because Stochastic Performs the Best in CV 
+
+```{}
+h2o.performance(model = best_model,  newdata = test_h2o)
+
+```
+
+
+
+
+# XGBoost
+
+## Train
+
+```{r}
+X<- as.matrix(pubg.train.baked[setdiff(names(pubg.train.baked),'winPlacePerc')])
+Y<- pubg.train.baked$winPlacePerc
+```
+
+```{r}
+hyper_grid2 <- expand.grid(
+  eta=0.01,
+    max_depth=7,
+    min_child_weight=5,
+    subsample=0.5,
+    colsample_bytree=0.5,
+  gamma=c(0,0.001,0.01,0.1),
+  lambda=0,
+  alpha=0.1,
+  rmse=0,
+  trees=0
+)
+```
+
+```{r}
+
+for(i in seq_len(nrow(hyper_grid2))){
+set.seed(7027)
+m <- xgb.cv(
+  data=X,
+  label=Y,
+  nrounds=4000,
+  objective='reg:squarederror',
+  early_stopping_rounds=50,
+  nfold=5,
+  verbose=0,
+  params=list(
+    eta=hyper_grid2$eta[i],
+    max_depth=hyper_grid2$max_depth[i],
+    min_child_weight=hyper_grid2$min_child_weight[i],
+    subsample=hyper_grid2$subsample[i],
+    colsample_bytree=hyper_grid2$colsample_bytree[i],
+    gamma=hyper_grid2$gamma[i],
+    lambda=hyper_grid2$lambda[i],
+    alpha=hyper_grid2$alpha[i]),
+)
+
+hyper_grid2$rmse[i] <- min(m$evaluation_log$test_rmse_mean)
+hyper_grid2$trees[i] <- m$best_iteration
+}
+```
+
+
+
+```{r}
+# results
+head(arrange(hyper_grid2,rmse))
+```
+
+```{r}
+xgb_cv_rmse <- min(hyper_grid2$rmse)
+xgb_cv_rmse
+```
+
+```{r}
+set.seed(7027)
+bestparams <- list(
+  eta = 0.01,
+  max_depth = 7,
+  min_child_weight = 10,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 0,
+  gamma = 0,
+  alpha = 0.1
+)
+
+# train final model
+bestxgb <- xgboost(
+  params = bestparams,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:linear",
+  verbose = 0
+)
+```
+
+
+# Feature Interpretation
+
+## GAM
+
+```{r}
+set.seed(7027)
+
+vip(
+  gam_fit,
+  feature_names = NULL,
+  train = pubg.train.1,
+  target = "winPlacePerc",
+  metric = "RMSE",
+  nsim = 5,
+  keep = TRUE,
+  sample_frac = 0.5,
+  pred_wrapper = predict,
+  verbose = FALSE,
+  progress = "none",
+  parallel = FALSE,
+  paropts = NULL,
+  method = "permute",
+  plot = TRUE
+) 
+```
+
+```{r}
+partial(gam_fit, "killPlace", plot = TRUE, grid.resolution = 20)
+partial(gam_fit, "kills", plot = TRUE, grid.resolution = 20)
+partial(gam_fit, "walkDistance", plot = TRUE, grid.resolution = 20)
+partial(gam_fit, "killStreaks", plot = TRUE, grid.resolution = 20)
+```
+
+
+## Random Forest
+
+```{r}
+vip(bestrf, plot = TRUE) #importance = "permutation" when building random forest model thus can be directly plotted
+```
+
+```{r}
+partial(bestrf, "walkDistance", plot = TRUE, grid.resolution = 20)
+partial(bestrf, "killPlace", plot = TRUE, grid.resolution = 20)
+partial(bestrf, "boosts", plot = TRUE, grid.resolution = 20)
+partial(bestrf, "weaponsAcquired", plot = TRUE, grid.resolution = 20)
+```
+
+## Basic GBM
+
+```{r}
+set.seed(7027)
+
+vip(
+  bestgbm,
+  feature_names = NULL,
+  train = pubg.train.baked,
+  target = "winPlacePerc",
+  metric = "RMSE",
+  nsim = 5,
+  keep = TRUE,
+  sample_frac = 0.5,
+  pred_wrapper = predict,
+  verbose = FALSE,
+  progress = "none",
+  parallel = FALSE,
+  paropts = NULL,
+  method = "permute",
+  plot = TRUE
+) 
+
+
+```
+
+
+```{r}
+partial(bestgbm, "killPlace", plot = TRUE, grid.resolution = 20, n.trees = 5000)
+partial(bestgbm, "walkDistance", plot = TRUE, grid.resolution = 20, n.trees = 5000)
+partial(bestgbm, "kills", plot = TRUE, grid.resolution = 20, n.trees = 5000)
+partial(bestgbm, "matchDuration", plot = TRUE, grid.resolution = 20, n.trees = 5000)
+```
+
+
+
+## XGBoost
+
+```{r}
+set.seed(7027)
+
+vip(
+  bestxgb,
+  feature_names = NULL,
+  train = as.matrix(pubg.train.baked),
+  target = "winPlacePerc",
+  metric = "RMSE",
+  nsim = 5,
+  keep = TRUE,
+  sample_frac = 0.5,
+  pred_wrapper = predict,
+  verbose = FALSE,
+  progress = "none",
+  parallel = FALSE,
+  paropts = NULL,
+  method = "permute",
+  plot = TRUE
+) 
+
+
+```
+
+```{r}
+partial(bestxgb, "killPlace", plot = TRUE, grid.resolution = 20, train = X)
+partial(bestxgb, "walkDistance", plot = TRUE, grid.resolution = 20, train = X)
+partial(bestxgb, "kills", plot = TRUE, grid.resolution = 20, train = X)
+partial(bestxgb, "matchDuration", plot = TRUE, grid.resolution = 20, train = X)
+```
+
+
+
